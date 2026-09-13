@@ -130,6 +130,14 @@ class ArxivRetriever(BaseRetriever):
         ]
         if self.config.executor.debug:
             all_paper_ids = all_paper_ids[:10]
+            if not all_paper_ids:
+                logger.info("Debug: RSS feed empty (weekend/holiday). Falling back to latest papers by submitted date.")
+                search = arxiv.Search(
+                    query=f"cat:{self.config.source.arxiv.category[0]}",
+                    sort_by=arxiv.SortCriterion.SubmittedDate,
+                    max_results=5,
+                )
+                return list(client.results(search))
 
         # Get full information of each paper from arxiv api
         bar = tqdm(total=len(all_paper_ids))
