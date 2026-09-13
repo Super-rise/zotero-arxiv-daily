@@ -5,12 +5,15 @@ from .utils import glob_match
 from .retriever import get_retriever_cls
 from .protocol import CorpusPaper
 import random
+import re
 from datetime import datetime
 from .reranker import get_reranker_cls
 from .construct_email import render_email
 from .utils import send_email
 from openai import OpenAI
 from tqdm import tqdm
+
+_ARXIV_ID_RE = re.compile(r'^(\d{4}\.\d{4,5})(?:v\d+)?\.(?:pdf|dvi)$', re.IGNORECASE)
 
 
 def normalize_path_patterns(patterns: list[str] | ListConfig | None, config_key: str) -> list[str] | None:
@@ -54,13 +57,63 @@ class Executor:
         for c in corpus:
             paths = [get_collection_path(col) for col in c['data']['collections']]
             c['paths'] = paths
-        logger.info(f"Fetched {len(corpus)} zotero papers")
-        return [CorpusPaper(
-            title=c['data']['title'],
-            abstract=c['data']['abstractNote'],
-            added_date=datetime.strptime(c['data']['dateAdded'], '%Y-%m-%dT%H:%M:%SZ'),
-            paths=c['paths']
-        ) for c in corpus]
+        if corpus:
+            logger.info(f"Fetched {len(corpus)} zotero papers")
+            return [CorpusPaper(
+                title=c['data']['title'],
+                abstract=c['data']['abstractNote'],
+                added_date=datetime.strptime(c['data']['dateAdded'], '%Y-%m-%dT%H:%M:%SZ'),
+                paths=c['paths']
+            ) for c in corpus]
+        logger.info("No zotero papers with abstracts found. Falling back to arXiv attachment IDs...")
+        return self._fetch_attachment_corpus(zot)
+
+    def _fetch_attachment_corpus(self, zot) -> list[CorpusPaper]:
+        """Build corpus from orphan PDF attachments named by arXiv ID (e.g. 2605.08764.pdf).
+
+        Libraries created by bulk-adding arXiv PDFs may only contain attachments
+        without parent metadata. Resolve each ID's title/abstract via the arXiv API.
+        """
+        import arxiv as arxiv_lib
+        items = zot.everything(zot.items(limit=200))
+        id_to_date = {}
+        for it in items:
+            if it['data']['itemType'] != 'attachment':
+                continue
+            m = _ARXIV_ID_RE.match(it['data'].get('title', '') or '')
+            if not m:
+                continue
+            id_to_date.setdefault(m.group(1), it['data'].get('dateAdded', ''))
+        if not id_to_date:
+            logger.warning("No arXiv-named attachments found. Corpus stays empty.")
+            return []
+        logger.info(f"Found {len(id_to_date)} arXiv IDs in attachments. Resolving metadata...")
+        client = arxiv_lib.Client(num_retries=5, delay_seconds=10, page_size=100)
+        metas = {}
+        try:
+            search = arxiv_lib.Search(id_list=list(id_to_date.keys()))
+            for p in client.results(search):
+                metas[p.get_short_id()] = p
+        except Exception as e:
+            logger.warning(f"Failed to resolve arXiv metadata: {e}")
+            return []
+        corpus = []
+        for aid, date in id_to_date.items():
+            p = metas.get(aid)
+            if p is None:
+                continue
+            try:
+                added = datetime.strptime(date, '%Y-%m-%dT%H:%M:%SZ')
+            except (ValueError, TypeError):
+                continue
+            corpus.append(CorpusPaper(
+                title=p.title,
+                abstract=(p.summary or '').replace('\n', ' '),
+                added_date=added,
+                paths=[]
+            ))
+        logger.info(f"Built attachment corpus with {len(corpus)} papers")
+        return corpus
     
     def filter_corpus(self, corpus:list[CorpusPaper]) -> list[CorpusPaper]:
         if self.include_path_patterns:
