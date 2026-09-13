@@ -1,7 +1,7 @@
 from loguru import logger
 from pyzotero import zotero
 from omegaconf import DictConfig, ListConfig
-from .utils import glob_match
+from .utils import glob_match, resolve_arxiv_metadata
 from .retriever import get_retriever_cls
 from .protocol import CorpusPaper
 import random
@@ -87,7 +87,7 @@ class Executor:
             logger.warning("No arXiv-named attachments found. Corpus stays empty.")
             return []
         logger.info(f"Found {len(id_to_date)} arXiv IDs in attachments. Resolving metadata...")
-        metas = self._resolve_arxiv_metadata(list(id_to_date.keys()))
+        metas = resolve_arxiv_metadata(list(id_to_date.keys()))
         corpus = []
         for aid, date in id_to_date.items():
             meta = metas.get(aid)
@@ -106,67 +106,7 @@ class Executor:
         logger.info(f"Built attachment corpus with {len(corpus)} papers")
         return corpus
 
-    def _resolve_arxiv_metadata(self, arxiv_ids: list[str]) -> dict[str, dict]:
-        """Resolve title/abstract for arXiv IDs.
 
-        Primary: OpenAlex by arXiv DOI (10.48550/...). Secondary: Semantic
-        Scholar batch API. The arXiv export API often returns HTTP 429 from
-        shared GitHub Actions runner IPs, so it is avoided entirely.
-        """
-        import requests as _requests
-        metas: dict[str, dict] = {}
-
-        def _reconstruct_abstract(inv: dict | None) -> str:
-            if not inv:
-                return ""
-            positions: dict[int, str] = {}
-            for word, idxs in inv.items():
-                for i in idxs:
-                    positions[i] = word
-            return " ".join(positions[i] for i in sorted(positions))
-
-        session = _requests.Session()
-        session.headers.update({"User-Agent": "zotero-arxiv-daily/1.0 (mailto:lijinxi2481@163.com)"})
-        missing: list[str] = []
-        for aid in arxiv_ids:
-            try:
-                resp = session.get(
-                    f"https://api.openalex.org/works/doi:10.48550/arXiv.{aid}",
-                    timeout=30,
-                )
-                if resp.status_code == 200:
-                    m = resp.json()
-                    title = (m.get("display_name") or "").strip()
-                    abstract = _reconstruct_abstract(m.get("abstract_inverted_index"))
-                    if title or abstract:
-                        metas[aid] = {"title": title, "abstract": abstract}
-                        continue
-            except Exception as e:
-                logger.debug(f"OpenAlex lookup failed for {aid}: {e}")
-            missing.append(aid)
-        if missing:
-            try:
-                resp = _requests.post(
-                    "https://api.semanticscholar.org/graph/v1/paper/batch",
-                    params={"fields": "title,abstract,externalIds"},
-                    json={"ids": [f"ARXIV:{aid}" for aid in missing]},
-                    timeout=90,
-                )
-                resp.raise_for_status()
-                for item in resp.json():
-                    if not item:
-                        continue
-                    ext = item.get("externalIds") or {}
-                    aid = ext.get("ArXiv")
-                    if not aid:
-                        continue
-                    title = item.get("title") or ""
-                    abstract = (item.get("abstract") or "").replace("\n", " ")
-                    if title or abstract:
-                        metas[aid] = {"title": title, "abstract": abstract}
-            except Exception as e:
-                logger.warning(f"Semantic Scholar fallback failed: {e}")
-        return metas
     
     def filter_corpus(self, corpus:list[CorpusPaper]) -> list[CorpusPaper]:
         if self.include_path_patterns:
