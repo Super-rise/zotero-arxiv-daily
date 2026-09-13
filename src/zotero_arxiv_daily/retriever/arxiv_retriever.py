@@ -1,8 +1,10 @@
+import re
+
 from .base import BaseRetriever, register_retriever
 import arxiv
 from arxiv import Result as ArxivResult
 from ..protocol import Paper
-from ..utils import extract_markdown_from_pdf, extract_tex_code_from_tar
+from ..utils import extract_markdown_from_pdf, extract_tex_code_from_tar, resolve_arxiv_metadata
 from tempfile import TemporaryDirectory
 import feedparser
 from tqdm import tqdm
@@ -19,6 +21,34 @@ T = TypeVar("T")
 DOWNLOAD_TIMEOUT = (10, 60)
 PDF_EXTRACT_TIMEOUT = 180
 TAR_EXTRACT_TIMEOUT = 180
+
+
+class _Author:
+    def __init__(self, name: str):
+        self.name = name
+
+
+class _FeedPaper:
+    """Minimal arxiv.Result stand-in built from an RSS entry.
+
+    Avoids the export API (which 429s from GitHub Actions runner IPs).
+    Implements the attribute surface that Paper conversion and full-text
+    extraction rely on.
+    """
+
+    def __init__(self, *, title: str, summary: str, entry_id: str,
+                 authors: list[str], pdf_url: str | None, arxiv_id: str):
+        self.title = title
+        self.summary = summary
+        self.entry_id = entry_id
+        self.authors = [_Author(a) for a in authors if a]
+        self.pdf_url = pdf_url
+        self._arxiv_id = arxiv_id
+
+    def source_url(self) -> str | None:
+        if not self._arxiv_id:
+            return None
+        return f"https://arxiv.org/e-print/{self._arxiv_id}"
 
 
 def _download_file(url: str, path: str) -> None:
@@ -114,55 +144,78 @@ class ArxivRetriever(BaseRetriever):
             raise ValueError("category must be specified for arxiv.")
 
     def _retrieve_raw_papers(self) -> list[ArxivResult]:
-        client = arxiv.Client(num_retries=10, delay_seconds=10)
         query = '+'.join(self.config.source.arxiv.category)
         include_cross_list = self.config.source.arxiv.get("include_cross_list", False)
-        # Get the latest paper from arxiv rss feed
+        # Get the latest papers straight from the arxiv RSS feed. The entries
+        # carry title/summary/authors/links, so the export API (which 429s
+        # from GitHub Actions runner IPs) is not needed at all.
         feed = feedparser.parse(f"https://rss.arxiv.org/atom/{query}")
         if 'Feed error for query' in feed.feed.title:
             raise Exception(f"Invalid ARXIV_QUERY: {query}.")
-        raw_papers = []
         allowed_announce_types = {"new", "cross"} if include_cross_list else {"new"}
-        all_paper_ids = [
-            i.id.removeprefix("oai:arXiv.org:")
+        raw_papers = [
+            self._entry_to_paper(i)
             for i in feed.entries
             if i.get("arxiv_announce_type", "new") in allowed_announce_types
         ]
         if self.config.executor.debug:
-            all_paper_ids = all_paper_ids[:10]
-            if not all_paper_ids:
-                logger.info("Debug: RSS feed empty (weekend/holiday). Falling back to latest papers by submitted date.")
-                search = arxiv.Search(
-                    query=f"cat:{self.config.source.arxiv.category[0]}",
-                    sort_by=arxiv.SortCriterion.SubmittedDate,
-                    max_results=5,
-                )
-                return list(client.results(search))
-
-        # Get full information of each paper from arxiv api
-        bar = tqdm(total=len(all_paper_ids))
-        max_batch_retries = 5
-        batch_retry_delay = 30
-        for i in range(0, len(all_paper_ids), 20):
-            search = arxiv.Search(id_list=all_paper_ids[i:i + 20])
-            for attempt in range(max_batch_retries):
-                try:
-                    batch = list(client.results(search))
-                    bar.update(len(batch))
-                    raw_papers.extend(batch)
-                    break
-                except arxiv.HTTPError as exc:
-                    if exc.status == 429 and attempt < max_batch_retries - 1:
-                        wait = batch_retry_delay * (attempt + 1)
-                        logger.warning(f"arXiv API 429 on batch {i // 20}, retry {attempt + 1}/{max_batch_retries} in {wait}s")
-                        sleep(wait)
-                    else:
-                        raise
-            if i + 20 < len(all_paper_ids):
-                sleep(3)
-        bar.close()
+            raw_papers = raw_papers[:5]
+            if not raw_papers:
+                logger.info("Debug: RSS feed empty (weekend/holiday). Falling back to listing page + OpenAlex...")
+                raw_papers = self._debug_fallback_papers()
 
         return raw_papers
+
+    def _debug_fallback_papers(self) -> list[ArxivResult]:
+        import requests
+
+        cat = self.config.source.arxiv.category[0]
+        resp = requests.get(f"https://arxiv.org/list/{cat}/recent", timeout=60)
+        resp.raise_for_status()
+        ids: list[str] = []
+        for aid in re.findall(r"/abs/(\d{4}\.\d{4,5})", resp.text):
+            if aid not in ids:
+                ids.append(aid)
+            if len(ids) >= 5:
+                break
+        if not ids:
+            logger.warning("Debug fallback found no arXiv IDs on listing page.")
+            return []
+        metas = resolve_arxiv_metadata(ids)
+        papers = []
+        for aid in ids:
+            meta = metas.get(aid)
+            if meta is None:
+                continue
+            papers.append(_FeedPaper(
+                title=meta.get("title", ""),
+                summary=meta.get("abstract", ""),
+                entry_id=f"https://arxiv.org/abs/{aid}",
+                authors=meta.get("authors", []),
+                pdf_url=f"https://arxiv.org/pdf/{aid}",
+                arxiv_id=aid,
+            ))
+        logger.info(f"Debug fallback produced {len(papers)} papers from listing + OpenAlex.")
+        return papers
+
+    @staticmethod
+    def _entry_to_paper(entry) -> "_FeedPaper":
+        aid = (entry.get("id") or "").removeprefix("oai:arXiv.org:")
+        pdf_url = None
+        for link in entry.get("links") or []:
+            if link.get("rel") == "related" and link.get("type") == "application/pdf":
+                pdf_url = link.get("href")
+                break
+        if pdf_url is None and aid:
+            pdf_url = f"https://arxiv.org/pdf/{aid}"
+        return _FeedPaper(
+            title=(entry.get("title") or "").strip(),
+            summary=re.sub(r"\s+", " ", entry.get("summary") or "").strip(),
+            entry_id=entry.get("link") or (f"https://arxiv.org/abs/{aid}" if aid else ""),
+            authors=[a.get("name", "") for a in (entry.get("authors") or [])],
+            pdf_url=pdf_url,
+            arxiv_id=aid,
+        )
 
     def convert_to_paper(self, raw_paper: ArxivResult) -> Paper:
         title = raw_paper.title
