@@ -169,3 +169,69 @@ def send_email(config:DictConfig, html:str):
     server.login(sender, password)
     server.sendmail(sender, [receiver], msg.as_string())
     server.quit()
+
+def resolve_arxiv_metadata(arxiv_ids: list[str]) -> dict[str, dict]:
+    """Resolve title/abstract/authors for arXiv IDs.
+
+    Primary: OpenAlex by arXiv DOI (10.48550/...). Secondary: Semantic Scholar
+    batch API. The arXiv export API often returns HTTP 429 from shared GitHub
+    Actions runner IPs, so it is avoided entirely.
+    """
+    import requests as _requests
+
+    metas: dict[str, dict] = {}
+
+    def _reconstruct_abstract(inv: dict | None) -> str:
+        if not inv:
+            return ""
+        positions: dict[int, str] = {}
+        for word, idxs in inv.items():
+            for i in idxs:
+                positions[i] = word
+        return " ".join(positions[i] for i in sorted(positions))
+
+    session = _requests.Session()
+    session.headers.update({"User-Agent": "zotero-arxiv-daily/1.0 (mailto:lijinxi2481@163.com)"})
+    missing: list[str] = []
+    for aid in arxiv_ids:
+        try:
+            resp = session.get(
+                f"https://api.openalex.org/works/doi:10.48550/arXiv.{aid}",
+                timeout=30,
+            )
+            if resp.status_code == 200:
+                m = resp.json()
+                title = (m.get("display_name") or "").strip()
+                abstract = _reconstruct_abstract(m.get("abstract_inverted_index"))
+                authors = [a["author"]["display_name"] for a in m.get("authorships", [])[:10]
+                           if a.get("author", {}).get("display_name")]
+                if title or abstract:
+                    metas[aid] = {"title": title, "abstract": abstract, "authors": authors}
+                    continue
+        except Exception as e:
+            logger.debug(f"OpenAlex lookup failed for {aid}: {e}")
+        missing.append(aid)
+    if missing:
+        try:
+            resp = _requests.post(
+                "https://api.semanticscholar.org/graph/v1/paper/batch",
+                params={"fields": "title,abstract,externalIds,authors"},
+                json={"ids": [f"ARXIV:{aid}" for aid in missing]},
+                timeout=90,
+            )
+            resp.raise_for_status()
+            for item in resp.json():
+                if not item:
+                    continue
+                ext = item.get("externalIds") or {}
+                aid = ext.get("ArXiv")
+                if not aid:
+                    continue
+                title = item.get("title") or ""
+                abstract = (item.get("abstract") or "").replace("\n", " ")
+                authors = [a.get("name", "") for a in item.get("authors", []) if a.get("name")]
+                if title or abstract:
+                    metas[aid] = {"title": title, "abstract": abstract, "authors": authors}
+        except Exception as e:
+            logger.warning(f"Semantic Scholar fallback failed: {e}")
+    return metas
